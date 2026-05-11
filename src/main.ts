@@ -85,6 +85,14 @@ const params = new URLSearchParams(window.location.search)
 const canvas = document.getElementById('game') as HTMLCanvasElement
 const ctx = canvas.getContext('2d')!
 
+/**
+ * Offscreen canvas holding the bg + faint grid lines. Rebuilt only on
+ * resize or theme change — drawn into the main canvas per frame as a
+ * single drawImage call instead of looping ~70 lineTos.
+ */
+const gridCanvas = document.createElement('canvas')
+const gridCtx = gridCanvas.getContext('2d')!
+
 const gridState: GridState = {
   COLS: 10,
   ROWS: 10,
@@ -105,6 +113,51 @@ const state: State = {
   aurelio: AURELIO[detectLang(params)],
   theme: detectTheme(params),
   portinari: PORTINARI[detectTheme(params)]
+}
+
+/**
+ * Render-loop driver. We don't redraw 60×/sec when nothing changed:
+ *
+ * - `dirty` is set by anything that visibly changes the scene (a tick, a
+ *   status flip, theme/lang toggle, resize).
+ * - `rafId` tracks an in-flight requestAnimationFrame so we don't stack
+ *   duplicate scheduled callbacks.
+ * - During `playing`, RAF stays alive (we need to drive ticks). Draw still
+ *   only fires when dirty — drops paints from 60/sec to ~7/sec (tick rate).
+ * - When not playing, RAF parks after one draw and only restarts when
+ *   something calls `invalidate()`.
+ */
+let dirty = true
+let rafId: number | null = null
+
+const scheduleFrame = () => {
+  if (rafId != null) return
+  rafId = requestAnimationFrame(loop)
+}
+
+const invalidate = () => {
+  dirty = true
+  scheduleFrame()
+}
+
+const buildGridCache = () => {
+  gridCanvas.width = gridState.W
+  gridCanvas.height = gridState.H
+  gridCtx.imageSmoothingEnabled = false
+  gridCtx.fillStyle = state.portinari.bg
+  gridCtx.fillRect(0, 0, gridState.W, gridState.H)
+  gridCtx.strokeStyle = state.portinari.grid
+  gridCtx.lineWidth = 1
+  gridCtx.beginPath()
+  for (let i = 1; i < gridState.COLS; i++) {
+    gridCtx.moveTo(i * CELL + 0.5, 0)
+    gridCtx.lineTo(i * CELL + 0.5, gridState.H)
+  }
+  for (let i = 1; i < gridState.ROWS; i++) {
+    gridCtx.moveTo(0, i * CELL + 0.5)
+    gridCtx.lineTo(gridState.W, i * CELL + 0.5)
+  }
+  gridCtx.stroke()
 }
 
 const spawnApple = () => {
@@ -174,8 +227,10 @@ const recomputeGrid = () => {
 
 const applyResize = () => {
   recomputeGrid()
+  buildGridCache()
   reset()
   state.status = 'start'
+  invalidate()
 }
 
 const tick = () => {
@@ -250,25 +305,9 @@ const drawOverlay = () => {
 }
 
 const draw = () => {
-  /**
-   * Set the canvas width and height
-   * that should be the biggest possible multiple of the column size
-   */
-  ctx.fillStyle = state.portinari.bg
-  ctx.fillRect(0, 0, gridState.W, gridState.H)
-
-  ctx.strokeStyle = state.portinari.grid
-  ctx.lineWidth = 1
-  ctx.beginPath()
-  for (let i = 1; i < gridState.COLS; i++) {
-    ctx.moveTo(i * CELL + 0.5, 0)
-    ctx.lineTo(i * CELL + 0.5, gridState.H)
-  }
-  for (let i = 1; i < gridState.ROWS; i++) {
-    ctx.moveTo(0, i * CELL + 0.5)
-    ctx.lineTo(gridState.W, i * CELL + 0.5)
-  }
-  ctx.stroke()
+  // Single drawImage replaces the bg fill + ~70 lineTos for the grid.
+  // Cache is rebuilt only on resize or theme change.
+  ctx.drawImage(gridCanvas, 0, 0)
 
   // Apple
   ctx.fillStyle = state.portinari.apple
@@ -311,8 +350,15 @@ window.addEventListener('resize', () => {
 const langBtn = document.getElementById('lang-toggle') as HTMLButtonElement
 const themeBtn = document.getElementById('theme-toggle') as HTMLButtonElement
 
-langBtn?.addEventListener('click', () => changeLang(state))
-themeBtn?.addEventListener('click', () => changeTheme(state))
+langBtn?.addEventListener('click', () => {
+  changeLang(state)
+  invalidate()
+})
+themeBtn?.addEventListener('click', () => {
+  changeTheme(state)
+  buildGridCache() // grid color depends on theme
+  invalidate()
+})
 
 window
   .matchMedia('(prefers-color-scheme: light)')
@@ -320,6 +366,8 @@ window
     if (localStorage.getItem(THEME_KEY)) return
     state.theme = e.matches ? 'light' : 'dark'
     applyTheme(state)
+    buildGridCache()
+    invalidate()
   })
 
 let touchStart: { x: number; y: number } | null = null
@@ -356,6 +404,7 @@ canvas.addEventListener(
       else if (state.status === 'paused')
         state.status = 'playing'
 
+      invalidate()
       return
     }
 
@@ -387,32 +436,53 @@ window.addEventListener('keydown', (e) => {
       state.status = 'playing'
     }
     else if (state.status === 'paused') state.status = 'playing'
+
+    invalidate()
   } else if (k === 'p' || k === 'escape') {
     e.preventDefault()
     if (state.status === 'playing')
       state.status = 'paused'
     else if (state.status === 'paused') state.status = 'playing'
+
+    invalidate()
   }
 })
 
 // ---- Boot ----------------------------------------------------------------
 
-const loop = (timestamp: number) => {
+// `function` (not `const`) so it's hoisted — scheduleFrame() can reference
+// it from above in the file without TDZ.
+function loop(timestamp: number) {
+  rafId = null
+
   if (state.status === 'playing') {
     if (!state.lastTick) state.lastTick = timestamp
 
     if (timestamp - state.lastTick >= state.tickMs) {
       tick()
       state.lastTick = timestamp
+      dirty = true
     }
-  } else state.lastTick = 0
 
-  draw()
-  requestAnimationFrame(loop)
+    if (dirty) {
+      draw()
+      dirty = false
+    }
+    scheduleFrame() // keep alive — we need RAF to drive future ticks
+    return
+  }
+
+  state.lastTick = 0
+  if (dirty) {
+    draw()
+    dirty = false
+  }
+  // Park: don't schedule another frame. Resumes on next invalidate().
 }
 
 applyTheme(state)
 applyLang(state)
 recomputeGrid()
+buildGridCache()
 reset()
-requestAnimationFrame(loop)
+invalidate()
