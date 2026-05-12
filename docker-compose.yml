@@ -12,7 +12,7 @@ name: snake
 
 services:
   snake:
-    image: ${SNAKE_IMAGE:-ghcr.io/joaocyrino/snake:latest}
+    image: ${SNAKE_IMAGE:-ghcr.io/joaopedrocyrino/browser-snake:latest}
     restart: unless-stopped
     networks: [proxy]
     labels:
