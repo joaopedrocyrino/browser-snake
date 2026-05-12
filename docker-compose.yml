@@ -1,0 +1,37 @@
+# Snake — production compose for the cyrino.dev droplet.
+#
+# Joins the existing `proxy` Docker network (owned by the cyrinosoftwarelab
+# stack — that's where caddy-docker-proxy lives). The labels below tell
+# caddy-docker-proxy to route snake.cyrino.dev to this container on port 80;
+# TLS cert is auto-provisioned by Let's Encrypt on first request.
+#
+# Image is built and pushed to GitHub Container Registry by the Actions
+# workflow in .github/workflows/deploy.yml.
+
+name: snake
+
+services:
+  snake:
+    image: ${SNAKE_IMAGE:-ghcr.io/joaocyrino/snake:latest}
+    restart: unless-stopped
+    networks: [proxy]
+    labels:
+      caddy: snake.cyrino.dev
+      caddy.reverse_proxy: "{{upstreams 80}}"
+      # Caddy security headers — applied at the proxy, not in nginx.
+      caddy.header.Strict-Transport-Security: "max-age=31536000; includeSubDomains"
+      caddy.header.X-Content-Type-Options: nosniff
+      caddy.header.Referrer-Policy: strict-origin-when-cross-origin
+    deploy:
+      resources:
+        limits:
+          memory: 32M
+
+networks:
+  # The proxy network is created and owned by the cyrinosoftwarelab stack.
+  # Declaring it as external means: "this network already exists; just
+  # attach to it." If you tear cyrinosoftwarelab down, this stack also
+  # needs to come down (or be re-pointed at whatever owns the proxy).
+  proxy:
+    external: true
+    name: proxy

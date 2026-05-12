@@ -1,0 +1,152 @@
+name: Deploy → Production
+
+on:
+  push:
+    branches: [main]
+
+# One production deploy at a time; let in-flight finish.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE:    ghcr.io/${{ github.repository }}
+
+jobs:
+  # ── 1. Build & push image ───────────────────────────────────────────────────
+  build:
+    name: Build & push Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.tag.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA tag
+        id: tag
+        run: echo "sha_tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file:    ./Dockerfile
+          push:    true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.sha_tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
+          cache-to:   type=inline
+
+  # ── 2. Deploy to droplet ────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to production droplet
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - name: Checkout (for compose file)
+        uses: actions/checkout@v4
+
+      - name: Copy compose file to droplet
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host:     ${{ secrets.PRODUCTION_DROPLET_HOST }}
+          username: ${{ secrets.PRODUCTION_DROPLET_SSH_USER }}
+          key:      ${{ secrets.PRODUCTION_DROPLET_SSH_KEY }}
+          source:   "docker-compose.yml"
+          target:   "/opt/snake"
+
+      - name: Deploy, health-check, and rollback if needed
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_TAG:  ${{ needs.build.outputs.image_tag }}
+          REPO:       ${{ github.repository }}
+          REGISTRY:   ${{ env.REGISTRY }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_USER:  ${{ github.actor }}
+        with:
+          host:     ${{ secrets.PRODUCTION_DROPLET_HOST }}
+          username: ${{ secrets.PRODUCTION_DROPLET_SSH_USER }}
+          key:      ${{ secrets.PRODUCTION_DROPLET_SSH_KEY }}
+          envs: IMAGE_TAG,REPO,REGISTRY,GHCR_TOKEN,GHCR_USER
+          script: |
+            set -euo pipefail
+
+            APP_DIR="/opt/snake"
+            COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+            ENV_FILE="$APP_DIR/.env"
+
+            mkdir -p "$APP_DIR"
+
+            # ── Record current image for rollback ─────────────────────────────
+            PREV_IMAGE=$(docker inspect \
+              $(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" \
+                ps -q snake 2>/dev/null || echo "") \
+              --format='{{index .Config.Image}}' 2>/dev/null || echo "")
+
+            # ── Write .env pinning SNAKE_IMAGE to this SHA (mode 600) ────────
+            cat > "$ENV_FILE" << ENVEOF
+            SNAKE_IMAGE=${REGISTRY}/${REPO}:${IMAGE_TAG}
+            ENVEOF
+            chmod 600 "$ENV_FILE"
+
+            # ── Log in to GHCR ────────────────────────────────────────────────
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+
+            # ── Pull new image ────────────────────────────────────────────────
+            docker pull "${REGISTRY}/${REPO}:${IMAGE_TAG}"
+
+            # ── Deploy snake ──────────────────────────────────────────────────
+            docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d snake
+
+            # ── Health check: 30s via Caddy on localhost ──────────────────────
+            # caddy-docker-proxy routes by Host header, so we send
+            # `Host: snake.cyrino.dev` even though we're hitting localhost.
+            echo "Waiting for health check..."
+            HEALTHY=false
+            for i in $(seq 1 6); do
+              sleep 5
+              STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+                -H "Host: snake.cyrino.dev" \
+                http://localhost/ 2>/dev/null || echo "000")
+              echo "  check ${i}/6 → HTTP ${STATUS}"
+              if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+                HEALTHY=true
+                break
+              fi
+            done
+
+            # ── Rollback if unhealthy ─────────────────────────────────────────
+            if [ "$HEALTHY" = "false" ]; then
+              echo "❌ Health check failed — rolling back"
+              if [ -n "$PREV_IMAGE" ]; then
+                sed -i "s|SNAKE_IMAGE=.*|SNAKE_IMAGE=${PREV_IMAGE}|" "$ENV_FILE"
+                docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d snake
+                echo "  Rollback applied — investigate manually"
+              fi
+              exit 1
+            fi
+
+            # ── Prune old images ──────────────────────────────────────────────
+            docker image prune -f --filter "until=24h"
+
+            echo "✅ Production deploy successful — tag: ${IMAGE_TAG}"
